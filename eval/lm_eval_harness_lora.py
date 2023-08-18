@@ -150,6 +150,8 @@ def run_eval_harness(
     )
     if save_filepath:
         data = json.dumps(results)
+        if not os.path.exists(save_filepath):
+            os.makedirs(save_filepath)
         with open(save_filepath, "w") as fw:
             fw.write(data)
         print(f"Results saved at {save_filepath}")
