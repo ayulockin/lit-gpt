@@ -7,6 +7,7 @@ from typing import Dict, List, Literal, Optional, Tuple
 import lightning as L
 import torch
 from lightning.fabric.strategies import FSDPStrategy, XLAStrategy
+from lightning.pytorch.loggers import WandbLogger
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -26,7 +27,22 @@ from lit_gpt.utils import (
     quantization,
     step_csv_logger,
 )
-from scripts.prepare_alpaca import generate_prompt
+# from scripts.prepare_alpaca import generate_prompt
+def generate_prompt(example):
+    """Generates a standardized message to prompt the model with an instruction, optional input and a
+    'response' field."""
+
+    if example["input"]:
+        return (
+            "Below is an instruction that describes a task, paired with an input that provides further context. "
+            "Write a response that appropriately completes the request.\n\n"
+            f"### Instruction:\n{example['instruction']}\n\n### Input:\n{example['input']}\n\n### Response:"
+        )
+    return (
+        "Below is an instruction that describes a task. "
+        "Write a response that appropriately completes the request.\n\n"
+        f"### Instruction:\n{example['instruction']}\n\n### Response:"
+    )
 
 eval_interval = 100
 save_interval = 100
@@ -34,25 +50,25 @@ eval_iters = 100
 log_interval = 1
 devices = 1
 # change this value to force a maximum sequence length
-override_max_seq_length = None
+override_max_seq_length = 2048
 
 # Hyperparameters
 learning_rate = 3e-4
 batch_size = 128
-micro_batch_size = 4
+micro_batch_size = 2
 gradient_accumulation_iters = batch_size // micro_batch_size
 assert gradient_accumulation_iters > 0
-max_iters = 50000  # train dataset size
+max_iters = 10  # train dataset size
 weight_decay = 0.01
-lora_r = 8
+lora_r = 4
 lora_alpha = 16
 lora_dropout = 0.05
 lora_query = True
-lora_key = False
+lora_key = True
 lora_value = True
-lora_projection = False
-lora_mlp = False
-lora_head = False
+lora_projection = True
+lora_mlp = True
+lora_head = True
 warmup_steps = 100
 
 hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
@@ -90,7 +106,13 @@ def setup(
         strategy = "auto"
 
     logger = step_csv_logger(out_dir.parent, out_dir.name, flush_logs_every_n_steps=log_interval)
-    fabric = L.Fabric(devices=fabric_devices, strategy=strategy, precision=precision, loggers=logger)
+
+    # Initialize W&B
+    wandb_logger = WandbLogger(project="llm-finetuning", **{"config": hparams})
+    # wandb_logger.experiment.config = hparams
+
+    # This is where Fabric is initialized
+    fabric = L.Fabric(devices=fabric_devices, strategy=strategy, precision=precision, loggers=[logger,wandb_logger])
     fabric.print(hparams)
     fabric.launch(main, data_dir, checkpoint_dir, out_dir, quantize)
 
@@ -238,13 +260,26 @@ def train(
                 f"iter {iter_num} step {step_count}: loss {loss.item():.4f}, iter time:"
                 f" {(t1 - iter_t0) * 1000:.2f}ms{' (optimizer.step)' if not is_accumulating else ''}"
             )
+            fabric.log_dict(
+                {"iter": iter_num,
+                "step": step_count,
+                "loss": loss.item(),
+                "iter time (ms)": (t1 - iter_t0) * 1000,}
+            )
 
         if not is_accumulating and step_count % eval_interval == 0:
             t0 = time.perf_counter()
             val_loss = validate(fabric, model, val_data, tokenizer, longest_seq_length)
             t1 = time.perf_counter() - t0
             speed_monitor.eval_end(t1)
+
             fabric.print(f"step {iter_num}: val loss {val_loss:.4f}, val time: {t1 * 1000:.2f}ms")
+            fabric.log_dict(
+                {"val_iter": iter_num,
+                "val_loss": val_loss,
+                "val_time (ms)": t1 * 1000,}
+            )
+
             fabric.barrier()
         if not is_accumulating and step_count % save_interval == 0:
             checkpoint_path = out_dir / f"iter-{iter_num:06d}-ckpt.pth"
