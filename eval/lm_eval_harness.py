@@ -236,13 +236,6 @@ def run_eval_harness(
         eval_tasks=eval_tasks, num_fewshot=num_fewshot, bootstrap_iters=bootstrap_iters, use_cache=False
     )
     print(results)
-    if save_filepath:
-        data = json.dumps(results)
-        if not os.path.exists(save_filepath):
-            os.makedirs(save_filepath)
-        with open(save_filepath, "w") as fw:
-            fw.write(data)
-        print(f"Results saved at {save_filepath}")
 
     if log_to_wandb:
         config = results["config"]
@@ -267,9 +260,19 @@ def run_eval_harness(
             job_type="eval-harness",
             config=results["config"]
         )
-        wandb.log(
-            results["results"]
-        )
+
+        results_tmp = results["results"]
+        tasks = list(results_tmp.keys())
+
+        for task in tasks:
+            wandb.log({f"{task}/{k}": v for k, v in results_tmp[task].items()}, commit=False)
+        wandb.log({})
+
+    if save_filepath:
+        data = json.dumps(results)
+        with open(save_filepath, "w") as fw:
+            fw.write(data)
+        print(f"Results saved at {save_filepath}")
 
     return results
 

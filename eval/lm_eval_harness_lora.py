@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import time
+import wandb
 import warnings
 from pathlib import Path
 from typing import List, Literal, Optional
@@ -20,13 +21,31 @@ from lm_eval_harness import EvalHarnessBase
 from lit_gpt import Tokenizer
 from lit_gpt.lora import GPT, Block, Config, merge_lora_weights
 from lit_gpt.utils import check_valid_checkpoint_dir, get_default_supported_precision, lazy_load, quantization
-from scripts.prepare_alpaca import generate_prompt
+# from scripts.prepare_alpaca import generate_prompt
 
-lora_r = 8
+
+def generate_prompt(example):
+    """Generates a standardized message to prompt the model with an instruction, optional input and a
+    'response' field."""
+
+    if example["input"]:
+        return (
+            "Below is an instruction that describes a task, paired with an input that provides further context. "
+            "Write a response that appropriately completes the request.\n\n"
+            f"### Instruction:\n{example['instruction']}\n\n### Input:\n{example['input']}\n\n### Response:"
+        )
+    return (
+        "Below is an instruction that describes a task. "
+        "Write a response that appropriately completes the request.\n\n"
+        f"### Instruction:\n{example['instruction']}\n\n### Response:"
+    )
+
+
+lora_r = 4
 lora_alpha = 16
 lora_dropout = 0.05
 lora_query = True
-lora_key = False
+lora_key = True
 lora_value = True
 lora_projection = False
 lora_mlp = False
@@ -130,6 +149,7 @@ def run_eval_harness(
     strategy: str = "auto",
     quantize: Optional[Literal["bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8", "gptq.int4"]] = None,
     save_filepath: Optional[str] = None,
+    log_to_wandb: bool = True,
 ):
     precision = precision or get_default_supported_precision(training=False)
 
@@ -149,10 +169,40 @@ def run_eval_harness(
     results = eval_harness.run_eval(
         eval_tasks=eval_tasks, num_fewshot=num_fewshot, bootstrap_iters=bootstrap_iters, use_cache=False
     )
+
+    if log_to_wandb:
+        config = results["config"]
+        config.update(
+            dict(
+                checkpoint_dir = checkpoint_dir,
+                precision = precision,
+                batch_size = batch_size,
+                eval_tasks = eval_tasks,
+                num_fewshot = num_fewshot,
+                bootstrap_iters = bootstrap_iters,
+                temperature = temperature,
+                device = device,
+                devices = 1,
+                strategy = strategy,
+                quantize = quantize,
+                save_filepath = save_filepath,
+            )
+        )
+        run = wandb.init(
+            project="llm-finetuning",
+            job_type="eval-harness",
+            config=results["config"]
+        )
+        
+        results_tmp = results["results"]
+        tasks = list(results_tmp.keys())
+
+        for task in tasks:
+            wandb.log({f"{task}/{k}": v for k, v in results_tmp[task].items()}, commit=False)
+        wandb.log({})
+
     if save_filepath:
         data = json.dumps(results)
-        if not os.path.exists(save_filepath):
-            os.makedirs(save_filepath)
         with open(save_filepath, "w") as fw:
             fw.write(data)
         print(f"Results saved at {save_filepath}")
