@@ -52,12 +52,12 @@ devices = 1
 override_max_seq_length = 2048
 
 # Hyperparameters
-learning_rate = 3e-4
+learning_rate = 2e-4
 batch_size = 128
 micro_batch_size = 2
 gradient_accumulation_iters = batch_size // micro_batch_size
 assert gradient_accumulation_iters > 0
-max_iters = 10  # train dataset size
+max_iters = 20000  # train dataset size
 weight_decay = 0.01
 lora_r = 4
 lora_alpha = 16
@@ -65,9 +65,9 @@ lora_dropout = 0.05
 lora_query = True
 lora_key = True
 lora_value = True
-lora_projection = True
-lora_mlp = True
-lora_head = True
+lora_projection = False
+lora_mlp = False
+lora_head = False
 warmup_steps = 100
 
 hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
@@ -102,7 +102,6 @@ def setup(
 
     # Initialize W&B
     wandb_logger = WandbLogger(project="llm-finetuning", **{"config": hparams})
-    # wandb_logger.experiment.config = hparams
 
     # This is where Fabric is initialized
     fabric = L.Fabric(devices=fabric_devices, strategy=strategy, precision=precision, loggers=[logger,wandb_logger])
@@ -149,6 +148,12 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path):
 
     fabric.print(f"Number of trainable parameters: {num_parameters(model, requires_grad=True):,}")
     fabric.print(f"Number of non trainable parameters: {num_parameters(model, requires_grad=False):,}")
+    fabric.log_dict(
+        {
+            "num_trainable_params": num_parameters(model, requires_grad=True),
+            "non_trainable_params": num_parameters(model, requires_grad=False)
+        }
+    )
     trainable_params = [p for p in model.parameters() if p.requires_grad]
 
     optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
@@ -159,8 +164,10 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path):
     train_time = time.perf_counter()
     train(fabric, model, optimizer, train_data, val_data, checkpoint_dir, out_dir, speed_monitor)
     fabric.print(f"Training time: {(time.perf_counter()-train_time):.2f}s")
+    fabric.log_dict({"training_time": time.perf_counter()-train_time})
     if fabric.device.type == "cuda":
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
+        fabric.log_dict({"memory_used": torch.cuda.max_memory_allocated() / 1e9})
 
     # Save the final LoRA checkpoint at the end of training
     save_path = out_dir / "lit_model_lora_finetuned.pth"
@@ -195,6 +202,12 @@ def train(
         x = torch.randint(0, 1, (micro_batch_size, longest_seq_length))
         measured_flops = measure_flops(meta_model, x)
         fabric.print(f"Measured TFLOPs: {measured_flops * fabric.world_size / 1e12:.2f}")
+        fabric.log_dict(
+            {
+                "estimated_flops": estimated_flops * fabric.world_size / 1e12,
+                "measured_flops": measured_flops * fabric.world_size / 1e12
+            }
+        )
         del meta_model, x
 
     step_count = 0
@@ -270,6 +283,7 @@ def train(
 
             fabric.barrier()
         if not is_accumulating and step_count % save_interval == 0:
+            fabric.print("Saving Lora checkpoint")
             checkpoint_path = out_dir / f"iter-{iter_num:06d}-ckpt.pth"
             save_lora_checkpoint(fabric, model, checkpoint_path)
 
