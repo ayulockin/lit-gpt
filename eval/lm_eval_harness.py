@@ -2,6 +2,7 @@ import os
 import json
 import sys
 import time
+import wandb
 import warnings
 from pathlib import Path
 from typing import List, Literal, Optional
@@ -216,6 +217,7 @@ def run_eval_harness(
     strategy: str = "auto",
     quantize: Optional[Literal["bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8", "gptq.int4"]] = None,
     save_filepath: Optional[str] = None,
+    log_to_wandb: bool = True
 ):
     precision = precision or get_default_supported_precision(training=False)
 
@@ -233,6 +235,7 @@ def run_eval_harness(
     results = eval_harness.run_eval(
         eval_tasks=eval_tasks, num_fewshot=num_fewshot, bootstrap_iters=bootstrap_iters, use_cache=False
     )
+    print(results)
     if save_filepath:
         data = json.dumps(results)
         if not os.path.exists(save_filepath):
@@ -240,6 +243,34 @@ def run_eval_harness(
         with open(save_filepath, "w") as fw:
             fw.write(data)
         print(f"Results saved at {save_filepath}")
+
+    if log_to_wandb:
+        config = results["config"]
+        config.update(
+            dict(
+                checkpoint_dir = checkpoint_dir,
+                precision = precision,
+                batch_size = batch_size,
+                eval_tasks = eval_tasks,
+                num_fewshot = num_fewshot,
+                bootstrap_iters = bootstrap_iters,
+                temperature = temperature,
+                device = device,
+                devices = 1,
+                strategy = strategy,
+                quantize = quantize,
+                save_filepath = save_filepath,
+            )
+        )
+        run = wandb.init(
+            project="llm-finetuning",
+            job_type="eval-harness",
+            config=results["config"]
+        )
+        wandb.log(
+            results["results"]
+        )
+
     return results
 
 
