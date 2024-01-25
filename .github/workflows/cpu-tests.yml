@@ -14,6 +14,9 @@ defaults:
   run:
     shell: bash
 
+env:
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
 jobs:
   cpu-tests:
     runs-on: ${{ matrix.os }}
@@ -21,8 +24,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: "macOS-11", python-version: "3.10"}
-          - {os: "ubuntu-20.04", python-version: "3.10"}
+          - {os: "macOS-12", python-version: "3.10"}
+          - {os: "ubuntu-22.04", python-version: "3.11"}
+          - {os: "ubuntu-22.04", python-version: "3.10"}
+          - {os: "ubuntu-22.04", python-version: "3.9"}
+          - {os: "ubuntu-20.04", python-version: "3.8"}
           - {os: "windows-2022", python-version: "3.10"}
     timeout-minutes: 25
 
@@ -36,32 +42,34 @@ jobs:
         cache: 'pip'
         cache-dependency-path: |
           requirements.txt
+          requirements-all.txt
           setup.py
 
     - name: Install minimal dependencies
       run: |
-        pip install --index-url https://download.pytorch.org/whl/nightly/cpu --pre torch>=2.1.0dev
         pip install -r requirements.txt
         pip list
         # make sure all modules are importable
         modules=$(
           find * -type f -name "*.py" | \
-          grep -v tests | grep "/" | grep -v lm_eval | \
+          grep -v tests | grep "/" | grep -v lm_eval | grep -v xla | grep -v prepare_slimpajama | grep -v prepare_starcoder | \
           sed 's/\.py$//' | sed 's/\//./g' | \
           sed 's/.__init__//g' | xargs -I {} echo "import {};"
         )
         echo "$modules"
         python -c "$modules"
 
-    - name: Run tests without the package installed
+    - name: Install all dependencies
       run: |
-        pip install pytest pytest-rerunfailures transformers einops bitsandbytes scipy tokenizers zstandard
+        pip install -r requirements-all.txt pytest pytest-rerunfailures pytest-timeout transformers>=4.36.0 einops protobuf
         pip list
 
-        pytest --disable-pytest-warnings --strict-markers --color=yes
+    - name: Run tests without the package installed
+      run: |
+        pytest -v --disable-pytest-warnings --strict-markers --color=yes --timeout 120
 
     - name: Run tests
       run: |
         pip install . --no-deps
 
-        pytest -v --durations=10 --disable-pytest-warnings --strict-markers --color=yes
+        pytest -v --disable-pytest-warnings --strict-markers --color=yes --timeout 120

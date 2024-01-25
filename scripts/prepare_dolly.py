@@ -1,13 +1,16 @@
+# Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
+
 """Implementation derived from https://github.com/tloen/alpaca-lora"""
+
 import json
 import sys
 from pathlib import Path
+from typing import Optional
 
 import requests
 import torch
 from torch.utils.data import random_split
 from tqdm import tqdm
-from typing import Optional
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -15,30 +18,19 @@ sys.path.append(str(wd))
 
 from lit_gpt.tokenizer import Tokenizer
 
-DATA_FILE_URL = (
-    "https://huggingface.co/datasets/databricks/databricks-dolly-15k/resolve/main/databricks-dolly-15k.jsonl"
-)
-DATA_FILE_NAME = "dolly_data_cleaned.json"
-DESTINATION_PATH = Path("data/dolly")
-CHECKPOINT_DIR = Path("checkpoints/stabilityai/stablelm-base-alpha-3b")
-TEST_SPLIT_FRACTION = 0.1
-IGNORE_INDEX = -1
-MASK_INPUTS = False
-SEED = 42
-
 
 def prepare(
-    destination_path: Path = DESTINATION_PATH,
-    checkpoint_dir: Path = CHECKPOINT_DIR,
-    test_split_fraction: float = TEST_SPLIT_FRACTION,
-    seed: int = SEED,
-    mask_inputs: bool = MASK_INPUTS,
-    data_file_name: str = DATA_FILE_NAME,
-    data_file_url: str = DATA_FILE_URL,
-    ignore_index: int = IGNORE_INDEX,
+    destination_path: Path = Path("data/dolly"),
+    checkpoint_dir: Path = Path("checkpoints/stabilityai/stablelm-base-alpha-3b"),
+    test_split_fraction: float = 0.1,
+    seed: int = 42,
+    mask_inputs: bool = False,
+    data_file_name: str = "dolly_data_cleaned.json",
+    data_file_url: str = "https://huggingface.co/datasets/databricks/databricks-dolly-15k/resolve/main/databricks-dolly-15k.jsonl",
+    ignore_index: int = -1,
     max_seq_length: Optional[int] = None,
 ) -> None:
-    """Prepare the Alpaca dataset for instruction tuning.
+    """Prepare the Dolly 15k dataset for instruction tuning.
 
     The output is a training and test dataset saved as `train.pt` and `test.pt`,
     which stores the preprocessed and tokenized prompts and labels.
@@ -100,7 +92,7 @@ def prepare(
     torch.save(test_set, destination_path / "test.pt")
 
 
-def download_if_missing(file_path: Path, file_url: str):
+def download_if_missing(file_path: Path, file_url: str) -> None:
     """Downloads the raw json data file and saves it in the given destination."""
     if file_path.exists():
         return
@@ -108,13 +100,7 @@ def download_if_missing(file_path: Path, file_url: str):
         f.write(requests.get(file_url).text)
 
 
-def prepare_sample(
-    example: dict,
-    tokenizer: Tokenizer,
-    max_length: int,
-    mask_inputs: bool = MASK_INPUTS,
-    ignore_index: int = IGNORE_INDEX,
-):
+def prepare_sample(example: dict, tokenizer: Tokenizer, max_length: int, mask_inputs: bool, ignore_index: int) -> dict:
     """Processes a single sample.
 
     Each sample in the dataset consists of:
@@ -141,15 +127,10 @@ def prepare_sample(
     if mask_inputs:
         labels[: len(encoded_full_prompt)] = ignore_index
 
-    return {
-        **example,
-        "input_ids": encoded_full_prompt_and_response,
-        "input_ids_no_response": encoded_full_prompt,
-        "labels": labels,
-    }
+    return {**example, "input_ids": encoded_full_prompt_and_response, "labels": labels}
 
 
-def generate_prompt(example):
+def generate_prompt(example: dict) -> str:
     """Generates a standardized message to prompt the model with an instruction, optional input and a
     'response' field."""
 

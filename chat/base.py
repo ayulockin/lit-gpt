@@ -1,129 +1,113 @@
-import json
+# Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
+
 import re
 import sys
 import time
-import warnings
+from json import dumps
 from pathlib import Path
 from typing import Iterator, List, Literal, Optional, Tuple
 
 import lightning as L
 import torch
+from lightning.fabric.plugins import BitsandbytesPrecision
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
+from generate.base import next_token
 from lit_gpt import GPT, Config, Tokenizer
-from lit_gpt.utils import check_valid_checkpoint_dir, get_default_supported_precision, lazy_load, quantization
+from lit_gpt.utils import check_valid_checkpoint_dir, get_default_supported_precision, load_checkpoint
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def generate(
-    model: torch.nn.Module,
-    idx: torch.Tensor,
+    model: GPT,
+    prompt: torch.Tensor,
     max_returned_tokens: int,
-    max_seq_length: int,
     *,
     temperature: float = 1.0,
     top_k: Optional[int] = None,
     stop_tokens: Tuple[List[int], ...] = (),
-):
+) -> Iterator[torch.Tensor]:
     """Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as possible.
 
     Args:
         model: The model to use.
-        idx: Tensor of shape (T) with indices of the prompt sequence.
+        prompt: Tensor of shape (T) with indices of the prompt sequence.
         max_returned_tokens: The maximum number of tokens to return (given plus generated).
-        max_seq_length: The maximum sequence length allowed. Should be less or equal than the block size.
         temperature: Scales the predicted logits by 1 / temperature
         top_k: If specified, only sample among the tokens with the k highest probabilities
         stop_tokens: If specified, stop generating any more token once one of this list is generated.
     """
-    T = idx.size(0)
+    T = prompt.size(0)
     assert max_returned_tokens > T
-    device = idx.device
-    stop_tokens = [torch.tensor(tokens, device=device) for tokens in stop_tokens]
-    input_pos = torch.arange(0, T, device=device)
+    if model.max_seq_length < max_returned_tokens - 1:
+        # rolling the kv cache based on the `input_pos` value would be necessary. However, doing so would introduce a
+        # data dependency on the `input_pos` tensor and impact model compilation. Since this setting is uncommon, we do
+        # not support it to avoid negatively impacting the overall speed
+        raise NotImplementedError(f"max_seq_length {model.max_seq_length} needs to be >= {max_returned_tokens - 1}")
 
-    # buffer holds the tokens that haven't been yield yet
+    device = prompt.device
     buffer_length = max((len(tokens) for tokens in stop_tokens), default=1)
-    buffer = torch.full((buffer_length,), -999, device=device)  # fill with non-existing token
-
-    if idx.device.type == "xla":
-        import torch_xla.core.xla_model as xm
-
-        xm.mark_step()
-
-    yield_i = -1
-    # generate up to a fixed number of tokens
-    for t in range(max_returned_tokens - T):
-        # forward
-        logits = model(idx.view(1, -1), max_seq_length, input_pos)
-        logits = logits[0, -1] / temperature
-
-        # optionally crop the logits to only the top k options
-        if top_k is not None:
-            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            logits = torch.where(logits < v[[-1]], -float("Inf"), logits)
-
-        probs = torch.nn.functional.softmax(logits, dim=-1)
-        idx = torch.multinomial(probs, num_samples=1)
-
-        # advance
-        input_pos = input_pos[-1:] + 1
-
-        if idx.device.type == "xla":
-            xm.mark_step()
-
-        # concatenate the new generation
-        buffer[min(t, buffer_length - 1)] = idx
-
+    yield_i = 0
+    input_pos = torch.arange(0, T, device=device)
+    tokens = []
+    token = prompt
+    for t in range(1, max_returned_tokens - T + 1):
+        token = next_token(model, input_pos, token.view(1, -1), temperature=temperature, top_k=top_k)
+        tokens.append(token)
         # check the stop condition
-        for tokens in stop_tokens:
-            l = len(tokens)
-            if torch.equal(buffer[-l:], tokens):
-                # stop token hit, yield any leftovers that aren't part of it
-                if buffer_length > l:  # avoid an empty yield
-                    yield buffer[:-l]
-                return
+        if any((l := len(st)) <= len(tokens) and all(a == b for a, b in zip(tokens[-l:], st)) for st in stop_tokens):
+            return
         # if the buffer is full
         if t - yield_i >= buffer_length:
             # we know this idx is not part of stop tokens, safe to yield
-            yield buffer[0]
-            # roll once to the left, as next generation will be put at the end
-            buffer = torch.roll(buffer, -1, 0)
-            yield_i += 1
+            yield from tokens[yield_i:t]
+            yield_i = t
+        input_pos = input_pos[-1:].add_(1)
 
 
 def decode(fabric: L.Fabric, tokenizer: Tokenizer, token_stream: Iterator[torch.Tensor]) -> int:
     tokens_generated = 0
     if tokenizer.backend == "huggingface":
-        for token in token_stream:
-            fabric.print(tokenizer.decode(token), end="", flush=True)
-            tokens_generated += 1
+        try:
+            for token in token_stream:
+                fabric.print(tokenizer.decode(token), end="", flush=True)
+                tokens_generated += 1
+        except KeyboardInterrupt:
+            # support stopping generation
+            return tokens_generated
     elif tokenizer.backend == "sentencepiece":
         # sentencepiece does not support decoding token-by-token because it adds spaces based on the surrounding tokens
         # meaning that we need to decode everything each time
         so_far = torch.tensor([], dtype=torch.long, device=fabric.device)
         decoded_so_far = ""
-        for token in token_stream:
-            so_far = torch.cat((so_far, token.view(-1)))
-            decoded_new = tokenizer.decode(so_far)
-            fabric.print(decoded_new[len(decoded_so_far) :], end="", flush=True)
-            decoded_so_far = decoded_new
-            tokens_generated += 1
+        try:
+            for token in token_stream:
+                so_far = so_far.to(device=token.device)
+                so_far = torch.cat((so_far, token.view(-1)))
+                decoded_new = tokenizer.decode(so_far)
+                fabric.print(decoded_new[len(decoded_so_far) :], end="", flush=True)
+                decoded_so_far = decoded_new
+                tokens_generated += 1
+        except KeyboardInterrupt:
+            # support stopping generation
+            return tokens_generated
     else:
         raise NotImplementedError(tokenizer.backend)
     return tokens_generated
 
 
+@torch.inference_mode()
 def main(
     *,
-    top_k: int = 200,
+    top_k: Optional[int] = 200,
     temperature: float = 0.8,
     checkpoint_dir: Path = Path("checkpoints/stabilityai/stablelm-tuned-alpha-3b"),
-    quantize: Optional[Literal["bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8", "gptq.int4"]] = None,
+    quantize: Optional[Literal["bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8"]] = None,
     precision: Optional[str] = None,
+    compile: bool = False,
 ) -> None:
     """Starts a conversation with a tuned GPT model.
 
@@ -135,38 +119,49 @@ def main(
         quantize: Whether to quantize the model and using which method:
             - bnb.nf4, bnb.nf4-dq, bnb.fp4, bnb.fp4-dq: 4-bit quantization from bitsandbytes
             - bnb.int8: 8-bit quantization from bitsandbytes
-            - gptq.int4: 4-bit quantization from GPTQ
             for more details, see https://github.com/Lightning-AI/lit-gpt/blob/main/tutorials/quantize.md
         precision: Indicates the Fabric precision setting to use.
+        compile: Whether to use compilation to speed up token generation. Will increase startup time.
     """
     precision = precision or get_default_supported_precision(training=False)
 
+    plugins = None
+    if quantize is not None and quantize.startswith("bnb."):
+        if "mixed" in precision:
+            raise ValueError("Quantization and mixed precision is not supported.")
+        dtype = {"16-true": torch.float16, "bf16-true": torch.bfloat16, "32-true": torch.float32}[precision]
+        plugins = BitsandbytesPrecision(quantize[4:], dtype)
+        precision = None
+
+    fabric = L.Fabric(devices=1, precision=precision, plugins=plugins)
+
     check_valid_checkpoint_dir(checkpoint_dir)
 
-    with open(checkpoint_dir / "lit_config.json") as fp:
-        config = Config(**json.load(fp))
+    config = Config.from_json(checkpoint_dir / "lit_config.json")
 
-    fabric = L.Fabric(devices=1, precision=precision)
+    checkpoint_path = checkpoint_dir / "lit_model.pth"
 
-    if quantize == "gptq.int4":
-        model_file = "lit_model_gptq.4bit.pth"
-        if not (checkpoint_dir / model_file).is_file():
-            raise ValueError("Please run `python quantize/gptq.py` first")
-    else:
-        model_file = "lit_model.pth"
-    checkpoint_path = checkpoint_dir / model_file
     fabric.print(f"Loading model {str(checkpoint_path)!r} with {config.__dict__}", file=sys.stderr)
-    with fabric.init_module(empty_init=True), quantization(quantize):
+    with fabric.init_module(empty_init=True):
         model = GPT(config)
-    with lazy_load(checkpoint_path) as checkpoint:
-        model.load_state_dict(checkpoint.get("model", checkpoint), strict=quantize is None)
-
+        # enable the kv cache
+        model.set_kv_cache(batch_size=1)
+    load_checkpoint(fabric, model, checkpoint_path)
     model.eval()
+
+    if compile:
+        torch._dynamo.config.automatic_dynamic_shapes = True
+        torch._inductor.config.triton.unique_kernel_names = True
+        torch._inductor.config.coordinate_descent_tuning = True
+        global next_token
+        next_token = torch.compile(next_token, mode="reduce-overhead", dynamic=True)
+
     model = fabric.setup_module(model)
 
     tokenizer = Tokenizer(checkpoint_dir)
     system_prompt, stop_tokens = prompt_config(checkpoint_dir, tokenizer)
 
+    L.seed_everything(1234)
     while True:
         try:
             prompt = input(">> Prompt: ")
@@ -176,28 +171,20 @@ def main(
             break
         prompt = system_prompt.format(prompt=prompt)
         encoded_prompt = tokenizer.encode(prompt, device=fabric.device)
-        max_returned_tokens = model.config.block_size
         y = generate(
-            model,
-            encoded_prompt,
-            max_returned_tokens,
-            max_seq_length=max_returned_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            stop_tokens=stop_tokens,
+            model, encoded_prompt, model.max_seq_length, temperature=temperature, top_k=top_k, stop_tokens=stop_tokens
         )
         fabric.print(">> Reply: ", end="")
-        try:
-            t0 = time.perf_counter()
-            tokens_generated = decode(fabric, tokenizer, y)
-            t = time.perf_counter() - t0
-            model.reset_cache()
-            fabric.print(
-                f"\nTime for inference: {t:.02f} sec total, {tokens_generated / t:.02f} tokens/sec", file=sys.stderr
-            )
-        except KeyboardInterrupt:
-            # support stopping generation
-            pass
+        t0 = time.perf_counter()
+        tokens_generated = decode(fabric, tokenizer, y)
+        t = time.perf_counter() - t0
+        for block in model.transformer.h:
+            block.attn.kv_cache.reset_parameters()
+        fabric.print(
+            f"\nTime for inference: {t:.02f} sec total, {tokens_generated / t:.02f} tokens/sec,"
+            f" {tokens_generated} tokens",
+            file=sys.stderr,
+        )
         fabric.print()
 
 
@@ -218,6 +205,12 @@ def prompt_config(checkpoint_dir: Path, tokenizer: Tokenizer) -> Tuple[str, Tupl
             [tokenizer.token_to_id("<|USER|>")],
         )
         return system_prompt, stop_tokens
+
+    if re.search(r"stabilityai/stablelm-zephyr-3b", checkpoint_name):
+        system_prompt = "<|user|>\n{prompt}<|endoftext|>\n<|assistant|>\n"
+        stop_tokens = ([tokenizer.eos_id],)
+        return system_prompt, stop_tokens
+
     if re.search(r"togethercomputer.*Chat", checkpoint_name):
         system_prompt = "<human>: {prompt}\n<bot>:"
         lt, gt = tokenizer.token_to_id("<"), tokenizer.token_to_id(">:")
@@ -264,6 +257,32 @@ def prompt_config(checkpoint_dir: Path, tokenizer: Tokenizer) -> Tuple[str, Tupl
         )
         stop_tokens = ([tokenizer.eos_id],)
         return system_prompt, stop_tokens
+
+    if re.search("Llama-2-7b-chat-hf-function-calling-v2", checkpoint_name):
+        # Has to be before the llama config
+        b_func, e_func = "<FUNCTIONS>", "</FUNCTIONS>\n\n"
+        b_inst, e_inst = "[INST]", "[/INST]"
+        b_sys, e_sys = "<<SYS>>\n", "\n<</SYS>>\n\n"
+        # This is an example for how to format functions for the model
+        function_metadata = {
+            "function": "search_bing",
+            "description": (
+                "Search the web for content on Bing. This allows users to search online/the internet/the web for"
+                " content."
+            ),
+            "arguments": [{"name": "query", "type": "string", "description": "The search query string"}],
+        }
+
+        system_prompt = (
+            "You are a helpful, respectful and honest assistant. Always answer as helpfully as"
+            "possible. Your only response should be JSON formatted functions"
+        )
+        # replace the curly braces with double curly braces to escape them
+        function_list = dumps(function_metadata).replace("{", "{{").replace("}", "}}")
+        system_prompt = f"{b_func}{function_list.strip()}{e_func}{b_inst}{b_sys}{system_prompt.strip()}{e_sys}{'{prompt}'}{e_inst}\n\n"
+        stop_tokens = ([tokenizer.eos_id],)
+        return system_prompt, stop_tokens
+
     if re.search("Llama-2.*-chat", checkpoint_name):
         b_inst, e_inst = "[INST]", "[/INST]"
         b_sys, e_sys = "<<SYS>>\n", "\n<</SYS>>\n\n"
@@ -288,6 +307,60 @@ def prompt_config(checkpoint_dir: Path, tokenizer: Tokenizer) -> Tuple[str, Tupl
         stop_tokens = ([tokenizer.eos_id],)
         return system_prompt, stop_tokens
 
+    if re.search("Platypus", checkpoint_name):
+        system_prompt = "### Instruction:\n\n{prompt}\n\n### Response:\n"
+        # this checkpoint doesn't emit the eos token very consistently
+        stop_tokens = ([tokenizer.eos_id],)
+        return system_prompt, stop_tokens
+
+    if re.search("NousResearch", checkpoint_name):
+        system_prompt = "### Instruction:\n{prompt}\n\n### Response:\n"
+        stop_tokens = ([tokenizer.eos_id],)
+        return system_prompt, stop_tokens
+
+    if re.search("stablecode-instruct", checkpoint_name):
+        system_prompt = "###Instruction\n{prompt}###Response\n"
+        stop_tokens = ([tokenizer.eos_id],)
+        return system_prompt, stop_tokens
+
+    if re.search("CodeLlama|Mistral.*Instruct", checkpoint_name):
+        # for CodeLLama, we don't set a default system prompt, but it is supported:
+        # https://huggingface.co/blog/codellama#conversational-instructions
+        # Mistral does not: https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.1#instruction-format
+        b_inst, e_inst = "<s>[INST]", "[/INST]"
+        system_prompt = f"{b_inst} {{prompt}} {e_inst}"
+        stop_tokens = ([tokenizer.eos_id],)
+        return system_prompt, stop_tokens
+
+    if re.search("phi-1", checkpoint_name):
+        system_prompt = "{prompt}\n\nAnswer:"
+
+        stop_tokens = (
+            [tokenizer.eos_id],
+            [tokenizer.token_to_id("Answer"), tokenizer.token_to_id(":")],
+            [198, tokenizer.token_to_id("Answer"), tokenizer.token_to_id(":")],
+            # the model rarely emits the eos token and instead outputs newlines, but we cannot use them
+            # to stop or else things like code generation wouldn't work
+            # [198, 198],  # '\n', '\n'
+        )
+        return system_prompt, stop_tokens
+
+    if re.search("phi-2", checkpoint_name):
+        system_prompt = "Instruct:{prompt}\nOutput:"
+        stop_tokens = ([tokenizer.eos_id],)
+        return system_prompt, stop_tokens
+
+    if re.search(r"TinyLlama.*Chat", checkpoint_name):
+        system_prompt = (
+            "<|system|>\n"
+            "You are a friendly chatbot who always gives helpful, detailed, and polite answers.</s>\n"
+            "<|user|>\n"
+            "{prompt}</s>\n"
+            "<|assistant|>\n"
+        )
+        stop_tokens = ([tokenizer.eos_id],)
+        return system_prompt, stop_tokens
+
     # default format
     return "{prompt}", ([tokenizer.eos_id],)
 
@@ -296,9 +369,4 @@ if __name__ == "__main__":
     from jsonargparse import CLI
 
     torch.set_float32_matmul_precision("high")
-    warnings.filterwarnings(
-        # Triggered internally at ../aten/src/ATen/EmptyTensor.cpp:31
-        "ignore",
-        message="ComplexHalf support is experimental and many operators don't support it yet",
-    )
     CLI(main)
