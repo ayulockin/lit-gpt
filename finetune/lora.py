@@ -28,7 +28,6 @@ from lit_gpt.utils import (
     load_checkpoint,
     num_parameters,
 )
-from configs.lora_config import lora_r, lora_alpha, lora_dropout, lora_query, lora_key, lora_value, lora_projection, lora_mlp, lora_head
 
 
 def generate_prompt(example):
@@ -61,9 +60,18 @@ micro_batch_size = 2
 gradient_accumulation_iters = batch_size // micro_batch_size
 assert gradient_accumulation_iters > 0
 max_seq_length = None  # assign value to truncate
-max_iters = 20_000  # train dataset size
+max_iters = 20000  # train dataset size
 max_steps = max_iters // gradient_accumulation_iters
 weight_decay = 0.01
+lora_r = 4
+lora_alpha = 16
+lora_dropout = 0.05
+lora_query = True
+lora_key = True
+lora_value = True
+lora_projection = False
+lora_mlp = False
+lora_head = False
 warmup_steps = 100
 
 hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
@@ -75,7 +83,6 @@ def setup(
     out_dir: Path = Path("out/lora/alpaca"),
     precision: Optional[str] = None,
     quantize: Optional[Literal["bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8-training"]] = None,
-    wandb_entity: str = "chamera"
 ) -> None:
     precision = precision or get_default_supported_precision(training=True)
 
@@ -104,7 +111,7 @@ def setup(
         strategy = "auto"
 
     # Initialize W&B
-    wandb_logger = WandbLogger(project="llm-finetuning", entity=wandb_entity, **{"config": hparams})
+    wandb_logger = WandbLogger(project="llm-finetuning", **{"config": hparams})
 
     logger = CSVLogger(out_dir.parent, out_dir.name, flush_logs_every_n_steps=log_interval)
     fabric = L.Fabric(devices=devices, strategy=strategy, precision=precision, loggers=[logger,wandb_logger], plugins=plugins)

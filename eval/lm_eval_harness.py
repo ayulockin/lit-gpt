@@ -143,8 +143,7 @@ def run_eval_harness(
     limit: Optional[int] = None,
     bootstrap_iters: int = 100000,
     no_cache: bool = True,
-    log_to_wandb: bool = True,
-    wandb_entity: str = "chamera"
+    log_to_wandb: bool = True
 ):
     if precision is None:
         precision = get_default_supported_precision(training=False)
@@ -197,7 +196,6 @@ def run_eval_harness(
         )
         run = wandb.init(
             project="llm-finetuning",
-            entity=wandb_entity,
             job_type="eval-harness",
             config=results["config"]
         )

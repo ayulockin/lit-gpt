@@ -9,7 +9,6 @@ import lightning as L
 import torch
 from lightning.fabric.plugins import BitsandbytesPrecision
 from lm_eval.base import BaseLM
-from configs.lora_config import lora_r, lora_alpha, lora_dropout, lora_query, lora_key, lora_value, lora_projection, lora_mlp, lora_head
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -36,6 +35,17 @@ def generate_prompt(example):
         "Write a response that appropriately completes the request.\n\n"
         f"### Instruction:\n{example['instruction']}\n\n### Response:"
     )
+
+
+lora_r = 4
+lora_alpha = 16
+lora_dropout = 0.05
+lora_query = True
+lora_key = True
+lora_value = True
+lora_projection = False
+lora_mlp = False
+lora_head = False
 
 
 class EvalHarnessLoRA(EvalHarnessBase):
@@ -73,7 +83,6 @@ def run_eval_harness(
     log_to_wandb: bool = True,
     limit: Optional[int] = None,
     no_cache: bool = True,
-    wandb_entity: str = "chamera"
 ):
     if precision is None:
         precision = get_default_supported_precision(training=False)
@@ -139,7 +148,6 @@ def run_eval_harness(
         )
         run = wandb.init(
             project="llm-finetuning",
-            entity=wandb_entity,
             job_type="eval-harness",
             config=results["config"]
         )
