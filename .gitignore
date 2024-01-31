@@ -8,8 +8,10 @@ build
 
 # data
 data
+datasets
 checkpoints
 out
 wandb
+events.out.tfevents*
 
-tests/original_falcon_40b.py
+tests/reference_models

@@ -16,6 +16,8 @@ python scripts/prepare_alpaca.py --checkpoint_dir checkpoints/tiiuae/falcon-7b
 
 or [prepare your own dataset](#tune-on-your-dataset).
 
+For more information about dataset preparation, also see the [prepare_dataset.md](./prepare_dataset.md) tutorial.
+
 ## Running the finetuning
 
 ```bash
@@ -49,7 +51,8 @@ You can test the finetuned model with your own instructions by running:
 ```bash
 python generate/full.py \
     --prompt "Recommend a movie to watch on the weekend." \
-    --checkpoint_dir checkpoints/stabilityai/stablelm-base-alpha-3b
+    --checkpoint_dir checkpoints/tiiuae/falcon-7b \
+    --finetuned_path out/full/my-model-finetuned/lit_model_finetuned.pth
 ```
 
 Output:
@@ -100,8 +103,3 @@ With only a few modifications, you can prepare and train on your own instruction
         --checkpoint_dir checkpoints/tiiuae/falcon-7b \
         --out_dir data/mydata-finetuned
     ```
-
-## Troubleshooting
-
-If you run into a CUDA error "Expected is_sm80 to be true, but got false", uncomment the line
-`torch.backends.cuda.enable_flash_sdp(False)` in the finetune script (see <https://github.com/Lightning-AI/lit-llama/issues/101>).

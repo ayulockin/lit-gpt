@@ -22,6 +22,8 @@ python scripts/prepare_alpaca.py --checkpoint_dir checkpoints/stabilityai/stable
 
 or [prepare your own dataset](#tune-on-your-dataset).
 
+For more information about dataset preparation, also see the [prepare_dataset.md](./prepare_dataset.md) tutorial.
+
 ## Running the finetuning
 
 ```bash
@@ -66,6 +68,22 @@ python finetune/adapter.py --out_dir out/adapter/my-model-finetuned --precision 
 ```
 
 Note that `mps` as the accelerator will be picked up automatically by Fabric when running on a modern Mac.
+
+### Quantization
+
+Optionally, finetuning using quantization can be enabled via the `--quantize` flag, for example using the 4-bit NormalFloat data type:
+
+```bash
+python finetune/adapter.py --quantize "bnb.nf4"
+```
+
+or using adapter_v2 with double-quantization:
+
+```bash
+python finetune/adapter_v2.py --quantize "bnb.nf4-dq"
+```
+
+For additional benchmarks and resource requirements, please see the [Resource Tables](resource-tables.md).
 
 ## Test the model
 
@@ -133,8 +151,3 @@ With only a few modifications, you can prepare and train on your own instruction
         --checkpoint_dir checkpoints/stabilityai/stablelm-base-alpha-3b \
         --out_dir data/mydata-finetuned
     ```
-
-## Troubleshooting
-
-If you run into a CUDA error "Expected is_sm80 to be true, but got false", uncomment the line
-`torch.backends.cuda.enable_flash_sdp(False)` in the finetune script (see <https://github.com/Lightning-AI/lit-llama/issues/101>).
